@@ -29,19 +29,20 @@ import org.elasticsearch.node.NodeBuilder;
 import static org.elasticsearch.common.xcontent.XContentFactory.jsonBuilder;
 
 /**
- * This is a simple test case for testing attachements removing.<br>
+ * This is a simple test case for testing binary attachements indexing.<br>
  * You may have a couchdb instance running on localhost:5984 with a mytest database.<br>
- * If you push documents with attachements in it, attachements should be ignored by the river.
+ * If you push documents with attachements in it, attachements will be indexed as well by the river.
  *
  * @author dadoonet (David Pilato)
  */
-public class CouchdbRiverAttachementTest {
+public class CouchdbRiverBinaryAttachementTest {
 
     public static void main(String[] args) throws Exception {
         String host = "localhost";
         String port = "5984";
         String db = "mytest";
-        boolean ignore_attachements = true;
+        boolean ignore_attachments = false;
+        boolean index_attachments = true;
 
         Node node = NodeBuilder.nodeBuilder().settings(ImmutableSettings.settingsBuilder().put("gateway.type", "local")).node();
         Thread.sleep(1000);
@@ -59,16 +60,18 @@ public class CouchdbRiverAttachementTest {
 
         XContentBuilder xb = jsonBuilder()
                 .startObject()
-                .field("type", "couchdb")
-                .startObject("couchdb")
-                .field("host", host)
-                .field("port", port)
-                .field("db", db)
-                .field("ignore_attachments", ignore_attachements)
-                .endObject()
+	                .field("type", "couchdb")
+	                .startObject("couchdb")
+		                .field("host", host)
+		                .field("port", port)
+		                .field("db", db)
+		                .field("ignore_attachments", ignore_attachments)
+                        .field("index_attachments", index_attachments)
+	                .endObject()
                 .endObject();
         node.client().prepareIndex("_river", db, "_meta").setSource(xb).execute().actionGet();
 
         Thread.sleep(100000);
     }
 }
+

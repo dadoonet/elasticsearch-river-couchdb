@@ -19,6 +19,13 @@
 
 package org.elasticsearch.river.couchdb;
 
+import org.ektorp.AttachmentInputStream;
+import org.ektorp.CouchDbConnector;
+import org.ektorp.CouchDbInstance;
+import org.ektorp.http.HttpClient;
+import org.ektorp.http.StdHttpClient;
+import org.ektorp.impl.StdCouchDbConnector;
+import org.ektorp.impl.StdCouchDbInstance;
 import org.elasticsearch.ExceptionsHelper;
 import org.elasticsearch.action.bulk.BulkRequestBuilder;
 import org.elasticsearch.action.bulk.BulkResponse;
@@ -46,8 +53,10 @@ import javax.net.ssl.HttpsURLConnection;
 import javax.net.ssl.SSLSession;
 import java.io.*;
 import java.net.HttpURLConnection;
+import java.net.MalformedURLException;
 import java.net.URL;
 import java.net.URLEncoder;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ArrayBlockingQueue;
@@ -76,6 +85,7 @@ public class CouchdbRiver extends AbstractRiverComponent implements River {
     private final String basicAuth;
     private final boolean noVerify;
     private final boolean couchIgnoreAttachments;
+    private final boolean couchIndexAttachments;
     private final TimeValue heartbeat;
     private final TimeValue readTimeout;
 
@@ -92,6 +102,9 @@ public class CouchdbRiver extends AbstractRiverComponent implements River {
     private volatile boolean closed;
 
     private final BlockingQueue<String> stream;
+
+    private CouchDbConnector couchDbClient = null;
+    
 
     @SuppressWarnings({"unchecked"})
     @Inject
@@ -125,6 +138,7 @@ public class CouchdbRiver extends AbstractRiverComponent implements River {
             heartbeat = XContentMapValues.nodeTimeValue(couchSettings.get("heartbeat"), TimeValue.timeValueSeconds(10));
             readTimeout = XContentMapValues.nodeTimeValue(couchSettings.get("read_timeout"), TimeValue.timeValueSeconds(heartbeat.getSeconds()*3));
             couchIgnoreAttachments = XContentMapValues.nodeBooleanValue(couchSettings.get("ignore_attachments"), false);
+            couchIndexAttachments = XContentMapValues.nodeBooleanValue(couchSettings.get("index_attachments"), false);
             if (couchSettings.containsKey("user") && couchSettings.containsKey("password")) {
                 String user = couchSettings.get("user").toString();
                 String password = couchSettings.get("password").toString();
@@ -151,6 +165,7 @@ public class CouchdbRiver extends AbstractRiverComponent implements River {
             couchFilter = null;
             couchFilterParamsUrl = null;
             couchIgnoreAttachments = false;
+            couchIndexAttachments = false;
             heartbeat = TimeValue.timeValueSeconds(10);
             readTimeout = TimeValue.timeValueSeconds(heartbeat.getSeconds()*3);
             noVerify = false;
@@ -188,6 +203,25 @@ public class CouchdbRiver extends AbstractRiverComponent implements River {
         logger.info("starting couchdb stream: host [{}], port [{}], filter [{}], db [{}], indexing to [{}]/[{}]", couchHost, couchPort, couchFilter, couchDb, indexName, typeName);
         try {
             client.admin().indices().prepareCreate(indexName).execute().actionGet();
+
+            if (couchIndexAttachments) {
+                // We define a starting mapping for attachments
+                XContentBuilder xbMapping =
+                        jsonBuilder()
+                                .startObject()
+                                .startObject(typeName)
+                                .startObject("properties")
+                                .startObject("_attachments")
+                                .startObject("properties")
+                                .startObject("attachment").field("type", "attachment").endObject()
+                                .endObject()
+                                .endObject()
+                                .endObject()
+                                .endObject()
+                                .endObject();
+                // Merge this mapping to existing one
+                client.admin().indices().preparePutMapping(indexName).setType(typeName).setSource(xbMapping).execute().actionGet();
+            }
         } catch (Exception e) {
             if (ExceptionsHelper.unwrapCause(e) instanceof IndexAlreadyExistsException) {
                 // that's fine
@@ -274,8 +308,30 @@ public class CouchdbRiver extends AbstractRiverComponent implements River {
                 // no need to log that we removed it, the doc indexed will be shown without it
                 doc.remove("_attachments");
             } else {
-                // TODO by now, couchDB river does not really store attachments but only attachments meta infomration
-                // So we perhaps need to fully support attachments
+            	// We have to change attachments field to real attachment
+            	if (couchIndexAttachments && doc.containsKey("_attachments")) {
+            		Map<String, Object> attachments = (Map<String, Object>) doc.get("_attachments");
+            		Map<String, Object> newAttachments = new HashMap<String, Object>();
+            		for (String attachmentName : attachments.keySet()) {
+						CouchDbConnector client = getCouchDbClient();
+						if (client != null) {
+							AttachmentInputStream ais = client.getAttachment(id, attachmentName);
+							String attachmentType = ais.getContentType();
+							String base64 = convertStreamToBase64String(ais);
+							
+		            		Map<String, Object> attachment = new HashMap<String, Object>();
+							attachment.put("_content_type", attachmentType);
+							attachment.put("_name", attachmentName);
+							attachment.put("content", base64);
+							
+							newAttachments.put("attachment", attachment);
+						}
+					}
+            		
+					// Let's replace the couchDb attachment by an ES one
+            		doc.remove(attachments);
+            		doc.put("_attachments", newAttachments);
+            	}
             }
 
             if (logger.isTraceEnabled()) {
@@ -287,6 +343,50 @@ public class CouchdbRiver extends AbstractRiverComponent implements River {
             logger.warn("ignoring unknown change {}", s);
         }
         return seq;
+    }
+
+    private String convertStreamToBase64String(InputStream is) {
+    	String result = "";
+        if (is != null) {
+            ByteArrayOutputStream os = new ByteArrayOutputStream();
+            byte[] buffer = new byte[1024];
+            try {
+                int n;
+                while ((n = is.read(buffer)) != -1) {
+                    os.write(buffer, 0, n);
+                }
+            } catch (IOException e) {
+            	logger.error("Can not read atachment stream from CouchDB");
+			} finally {
+                try {
+					is.close();
+				} catch (IOException e) {
+	            	logger.error("Can not close CouchDB stream");
+				}
+            }
+            
+            // Convert to BASE64
+            result = Base64.encodeBytes(os.toByteArray());
+        }
+        
+        return result;
+    }
+
+    private CouchDbConnector getCouchDbClient() {
+    	if (couchDbClient == null) {
+    		HttpClient httpClient;
+			try {
+				httpClient = new StdHttpClient.Builder()
+					.url(couchProtocol + "://" + couchHost + ":" + couchPort)
+					.build();
+	    		CouchDbInstance dbInstance = new StdCouchDbInstance(httpClient);
+	    		couchDbClient = new StdCouchDbConnector(couchDb, dbInstance);
+			} catch (MalformedURLException e) {
+				logger.warn("Can not connect to couchDB instance [{}]", couchProtocol + "://" + couchHost + ":" + couchPort);
+			}
+    	}
+
+		return couchDbClient;
     }
 
     private String extractParent(Map<String, Object> ctx) {

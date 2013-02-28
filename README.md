@@ -110,9 +110,14 @@ To use HTTPS, pass the **protocol** field. Most likely, you will also have to ch
 	    }
 	}
 
+Working with attachments
+========================
 
-Ignoring Attachments
-====================
+In couchDb, attachments are managed with specific fields (`_attachments`) added to the original JSon document.
+By default, Elasticsearch will index theses fields (not the attachment content itself) as is.
+
+Ignoring attachments
+--------------------
 
 You can ignore attachments as provided by couchDb for each document (`_attachments` field).
 
@@ -125,8 +130,29 @@ Here is an example setting that disable *attachments* for all docs:
 	  }
 	}
 
-Note, by default, attachments are not ignored (**false**)
+Note, by default, attachments are not ignored ( **false** )
 
+Indexing attachment content
+---------------------------
+
+If you need to index attachments as well, you will have to add the [mapper attachments plugin](https://github.com/elasticsearch/elasticsearch-mapper-attachments)
+prior to define the couchDb river.
+
+Note that it will slow down your couchDb river as couchDb river has to get all individual attachment from couchDB;
+attachments are not send by the [_changes](http://guide.couchdb.org/draft/notifications.html) API.
+
+To activate attachment indexing, you have to set `index_attachments` to `true`:
+
+	{
+	  "type":"couchdb",
+	  "couchdb": {
+	    "index_attachments":true
+	  }
+	}
+
+By default, attachments contents are not indexed ( **false** ).
+
+Note that if you set `ignore_attachments` to `true`, attachments will never be indexed, whatever you set for `index_attachments`.
 
 Heartbeat
 =========
