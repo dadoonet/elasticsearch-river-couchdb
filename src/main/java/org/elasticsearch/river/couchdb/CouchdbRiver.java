@@ -76,6 +76,7 @@ public class CouchdbRiver extends AbstractRiverComponent implements River {
     private final String basicAuth;
     private final boolean noVerify;
     private final boolean couchIgnoreAttachments;
+    private final boolean useRevisions;
 
     private final String indexName;
     private final String typeName;
@@ -139,6 +140,7 @@ public class CouchdbRiver extends AbstractRiverComponent implements River {
             } else {
                 script = null;
             }
+            useRevisions = XContentMapValues.nodeBooleanValue(couchSettings.get("use_revisions"), false);
         } else {
             couchProtocol = "http";
             couchHost = "localhost";
@@ -150,6 +152,7 @@ public class CouchdbRiver extends AbstractRiverComponent implements River {
             noVerify = false;
             basicAuth = null;
             script = null;
+            useRevisions = false;
         }
 
         if (settings.settings().containsKey("index")) {
@@ -255,7 +258,15 @@ public class CouchdbRiver extends AbstractRiverComponent implements River {
             if (logger.isTraceEnabled()) {
                 logger.trace("processing [delete]: [{}]/[{}]/[{}]", index, type, id);
             }
-            bulk.add(deleteRequest(index).type(type).id(id).routing(extractRouting(ctx)).parent(extractParent(ctx)));
+
+            // We don't need to remove old documents if our intention is to store all revisions
+            if (!useRevisions) {
+                bulk.add(deleteRequest(index).type(type).id(id).routing(extractRouting(ctx)).parent(extractParent(ctx)));
+            } else {
+                if (logger.isTraceEnabled()) {
+                    logger.trace("use_revision=true. Ignoring [delete]: [{}]/[{}]/[{}]", index, type, id);
+                }
+            }
         } else if (ctx.containsKey("doc")) {
             String index = extractIndex(ctx);
             String type = extractType(ctx);
@@ -268,6 +279,20 @@ public class CouchdbRiver extends AbstractRiverComponent implements River {
             } else {
                 // TODO by now, couchDB river does not really store attachments but only attachments meta infomration
                 // So we perhaps need to fully support attachments
+            }
+
+            // If we store revisions, we want to append the rev number to the id
+            if (useRevisions) {
+                StringBuffer sb = new StringBuffer(id);
+
+                String rev = doc.get("_rev").toString();
+                sb.append("_");
+                sb.append(rev);
+                id = sb.toString();
+                doc.put("_id", id);
+                if (logger.isTraceEnabled()) {
+                    logger.trace("use_revision=true. New doc id: [{}]", id);
+                }
             }
 
             if (logger.isTraceEnabled()) {
